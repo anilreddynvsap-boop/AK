@@ -1,0 +1,568 @@
+Architecture — Explanation
+🏗️ The Big Picture
+PostgreSQL follows a client-server, process-per-connection architecture. Here's the simplest way to think about it:
+
+
+
+┌─────────────────────────────────────────────────────────┐
+│                    CLIENT APPLICATIONS                   │
+│              (psql, your app, pgAdmin, etc.)             │
+└──────────────┬──────────┬──────────┬────────────────────┘
+               │          │          │
+          Connection  Connection  Connection
+               │          │          │
+┌──────────────▼──────────▼──────────▼────────────────────┐
+│                     POSTMASTER                           │
+│              (Main Boss Process - PID 1)                 │
+│         Listens on port 5432, spawns workers             │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
+│  │ Backend  │  │ Backend  │  │ Backend  │  ← One per    │
+│  │ Process 1│  │ Process 2│  │ Process 3│    connection  │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘              │
+│       │              │              │                    │
+│  ┌────▼──────────────▼──────────────▼─────┐             │
+│  │          SHARED MEMORY                  │             │
+│  │  ┌─────────────┐  ┌──────────────┐     │             │
+│  │  │Shared Buffers│  │  WAL Buffers │     │             │
+│  │  └─────────────┘  └──────────────┘     │             │
+│  │  ┌─────────────┐  ┌──────────────┐     │             │
+│  │  │  CLOG       │  │  Lock Table  │     │             │
+│  │  └─────────────┘  └──────────────┘     │             │
+│  └────────────────────────────────────────┘             │
+│                                                          │
+│  ┌──────────────── Background Workers ──────────────┐   │
+│  │ BGWriter │ WAL Writer │ Checkpointer │ Autovacuum│   │
+│  │ Stats    │ Archiver   │ Logical Rep  │ Launcher  │   │
+│  └──────────────────────────────────────────────────┘   │
+│                                                          │
+├─────────────────────────────────────────────────────────┤
+│                     STORAGE (Disk)                       │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
+│  │Data Files│  │ WAL Files│  │  Archive │              │
+│  │(tables,  │  │(pg_wal/) │  │  Logs    │              │
+│  │ indexes) │  │          │  │          │              │
+│  └──────────┘  └──────────┘  └──────────┘              │
+└─────────────────────────────────────────────────────────┘
+
+
+     PostgreSQL-Company
+
+
+Customers (client)
+    │
+    ▼
+Receptionist (Postmaster)
+    │
+    ▼
+Employee (Backend Process)
+    │
+    ▼
+Shared Office Resources (Shared Memory)
+    │
+    ▼
+Office Support Staff (Background Workers)
+    │
+    ▼
+Warehouse (Disk Storage)
+Block
+
+Simple Definition
+
+Client Applications
+
+Applications or users that send SQL queries to PostgreSQL.
+
+Connection
+
+A communication channel between the client and PostgreSQL.
+
+Postmaster
+
+The main PostgreSQL process that starts the server, accepts client connections, and creates backend processes.
+
+Backend Process
+
+A dedicated process that executes SQL queries for one client connection.
+
+Shared Memory
+
+A common area in RAM shared by all backend processes to improve performance and coordination.
+
+Shared Buffers
+
+The main cache that stores frequently accessed table and index pages in memory.
+
+WAL Buffers
+
+Temporary memory that stores change (WAL) records before they are written to WAL files on disk.
+
+CLOG (pg_xact)
+
+Stores the commit status of transactions (Committed, Aborted, or In Progress).
+
+Lock Table
+
+Keeps track of locks held by transactions to prevent conflicting operations.
+
+Background Workers
+
+Internal PostgreSQL processes that perform maintenance and system tasks automatically.
+
+BGWriter
+
+Writes modified (dirty) pages from Shared Buffers to data files gradually in the background.
+
+WAL Writer
+
+Writes WAL records from WAL Buffers to WAL files on disk.
+
+Checkpointer
+
+Periodically writes dirty pages to disk and creates checkpoints for faster crash recovery.
+
+Autovacuum
+
+Automatically removes dead rows and updates table statistics to maintain performance.
+
+Statistics Collector
+
+Collects database usage statistics that help the query planner choose efficient execution plans.
+
+Archiver
+
+Copies completed WAL files to an archive location for backup and recovery.
+
+Logical Replication Worker
+
+Sends or applies data changes to another PostgreSQL server using logical replication.
+
+Autovacuum Launcher
+
+Monitors databases and starts Autovacuum workers when needed.
+
+Data Files
+
+Files on disk that store the actual database tables, indexes, and other objects.
+
+WAL Files (pg_wal)
+
+Files that record every database change before it is written to the data files.
+
+Archive
+
+Long-term storage of WAL files used for backup and Point-in-Time Recovery (PITR).
+
+Logs
+
+Files that record PostgreSQL events such as startup, shutdown, errors, and connections.
+
+Super Short Version (Interview Revision)
+Client → Sends SQL to PostgreSQL.
+
+Connection → Communication channel.
+
+Postmaster → Accepts connections and creates backend processes.
+
+Backend Process → Executes SQL for one client.
+
+Shared Memory → Shared RAM for PostgreSQL processes.
+
+Shared Buffers → Database cache.
+
+WAL Buffers → Temporary cache for WAL records.
+
+CLOG (pg_xact) → Tracks transaction status.
+
+Lock Table → Manages locks.
+
+BGWriter → Writes dirty pages to disk.
+
+WAL Writer → Writes WAL to disk.
+
+Checkpointer → Creates checkpoints.
+
+Autovacuum → Cleans dead rows.
+
+Statistics Collector → Collects usage statistics.
+
+Archiver → Archives WAL files.
+
+Logical Replication Worker → Replicates changes.
+
+Autovacuum Launcher → Starts autovacuum workers.
+
+Data Files → Store actual database data.
+
+WAL Files → Store change history.
+
+Archive → Backup WAL storage.
+
+Logs → Store PostgreSQL activity and errors.
+
+
+
+👔 1. Postmaster (The Boss)
+
+
+-- See the postmaster process
+SELECT pg_backend_pid();  -- your connection's process ID
+-- From OS (Linux)
+ps aux | grep postgres
+What it does:
+
+Starts when you run pg_ctl start or systemctl start postgresql
+
+Listens on port 5432 (default)
+
+For every new client connection → spawns a new backend process
+
+If postmaster dies → everything dies
+
+Think of it like: A hotel receptionist. Every guest (client) that walks in gets assigned a personal butler (backend process).
+
+🧑‍💻 2. Backend Processes (One Per Connection)
+
+
+-- See all active backend processes
+SELECT pid, usename, application_name, state, query
+FROM pg_stat_activity;
+-- How many connections right now?
+SELECT count(*) FROM pg_stat_activity;
+-- Max allowed connections
+SHOW max_connections;  -- default: 100
+What each backend does:
+
+Receives your SQL query
+
+Parses it → checks syntax
+
+Plans it → finds the best execution strategy
+
+Executes it → reads/writes data
+
+Returns results to you
+
+Think of it like: Each backend is a personal chef. You give the order (SQL), the chef goes to the kitchen (shared memory + disk), cooks (executes), and brings back the dish (result).
+
+🧠 3. Shared Memory (The Common Kitchen)
+All backend processes share this memory area. It's the most important performance component.
+
+a) Shared Buffers — The Main Cache
+
+
+-- How big is the cache?
+SHOW shared_buffers;  -- default: 128MB (too low for production!)
+-- Recommended: 25% of total RAM
+-- e.g., 32GB RAM → set shared_buffers = 8GB
+-- See cache hit ratio (should be > 99%)
+SELECT
+    sum(blks_hit) AS cache_hits,
+    sum(blks_read) AS disk_reads,
+    round(sum(blks_hit) * 100.0 / 
+          nullif(sum(blks_hit) + sum(blks_read), 0), 2) AS hit_ratio
+FROM pg_stat_database;
+What it does: Keeps frequently used data pages (8KB blocks) in RAM so PostgreSQL doesn't have to read from disk every time.
+
+Think of it like: A kitchen counter. Instead of going to the storeroom (disk) for every ingredient, you keep the most-used ones on the counter (RAM).
+
+b) WAL Buffers — Write-Ahead Log Cache
+
+
+SHOW wal_buffers;  -- default: -1 (auto, usually 1/32 of shared_buffers)
+What it does: Temporarily holds WAL (transaction log) records before flushing them to disk.
+
+Think of it like: A notepad where the chef quickly jots down what was cooked before writing it in the official logbook.
+
+c) CLOG (Commit Log)
+What it does: Tracks the status of every transaction — committed, aborted, or in-progress. This is how MVCC knows which row versions are visible.
+
+Think of it like: A scoreboard showing which orders are done, cancelled, or still cooking.
+
+d) Lock Table
+
+
+-- See current locks
+SELECT locktype, relation::regclass, mode, granted, pid
+FROM pg_locks
+WHERE relation IS NOT NULL;
+What it does: Tracks who is locking what, to prevent conflicts.
+
+⚙️ 4. Background Worker Processes
+These run automatically — you don't call them directly.
+
+a) BGWriter (Background Writer)
+
+
+SHOW bgwriter_delay;  -- how often it runs (default: 200ms)
+-- See BGWriter stats
+SELECT * FROM pg_stat_bgwriter;
+What it does: Periodically writes dirty pages (modified data in shared buffers) to disk, so backends don't have to.
+
+Think of it like: A dishwasher who keeps cleaning plates in the background so the chefs don't have to stop cooking to wash dishes.
+
+b) WAL Writer
+
+
+SHOW wal_writer_delay;  -- default: 200ms
+What it does: Flushes WAL buffers to WAL files on disk. This is what makes PostgreSQL crash-safe — even if power goes out, committed transactions are in the WAL.
+
+Think of it like: The person who takes the chef's notepad and writes everything into the permanent logbook every 200ms.
+
+c) Checkpointer
+
+
+SHOW checkpoint_timeout;       -- default: 5min
+SHOW max_wal_size;             -- default: 1GB
+-- See checkpoint stats
+SELECT * FROM pg_stat_bgwriter;
+-- checkpoints_timed = scheduled checkpoints
+-- checkpoints_req   = forced checkpoints (too much WAL)
+What it does: Periodically writes ALL dirty pages to disk and creates a checkpoint record in WAL. After a crash, PostgreSQL only needs to replay WAL from the last checkpoint.
+
+Think of it like: A save point in a video game. If the game crashes, you restart from the last save, not from the beginning.
+
+d) Autovacuum Launcher
+
+
+SHOW autovacuum;           -- on/off
+SHOW autovacuum_naptime;   -- check interval (default: 1min)
+-- See autovacuum activity
+SELECT relname, last_autovacuum, autovacuum_count, n_dead_tup
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC;
+What it does: Spawns autovacuum worker processes to clean up dead tuples (from MVCC — as you already know!).
+
+Think of it like: A cleaning crew manager who checks every minute if any room needs cleaning.
+
+e) Stats Collector
+What it does: Collects usage statistics — which tables are accessed, how many rows scanned, cache hits, etc. All those pg_stat_* views you query come from here.
+
+f) Archiver
+
+
+SHOW archive_mode;     -- on/off
+SHOW archive_command;  -- command to copy WAL files
+What it does: Copies completed WAL files to an archive location for point-in-time recovery (PITR).
+
+Think of it like: A backup clerk who takes every filled logbook and stores it in a safe.
+
+💾 5. Storage Layer (Disk)
+a) Data Directory Layout
+
+
+SHOW data_directory;  -- where everything lives
+
+
+$PGDATA/
+├── base/              ← actual table & index data files
+│   ├── 16384/         ← one folder per database (OID)
+│   │   ├── 16385      ← one file per table/index (OID)
+│   │   ├── 16385_fsm  ← free space map
+│   │   └── 16385_vm   ← visibility map
+├── global/            ← cluster-wide tables (pg_database, etc.)
+├── pg_wal/            ← WAL files (transaction logs)
+├── pg_xact/           ← transaction commit status (CLOG)
+├── pg_stat/           ← statistics files
+├── pg_tblspc/         ← tablespace symlinks
+├── postgresql.conf    ← main config file
+├── pg_hba.conf        ← authentication config
+└── postmaster.pid     ← lock file with PID
+b) How a Table is Stored
+
+
+-- Find the physical file for a table
+SELECT pg_relation_filepath('your_table');
+-- Returns: base/16384/16385
+-- File size
+SELECT pg_size_pretty(pg_relation_size('your_table'));
+-- Total size including indexes and TOAST
+SELECT pg_size_pretty(pg_total_relation_size('your_table'));
+Each data file is divided into 8KB pages:
+
+
+
+┌─────────── One 8KB Page ───────────┐
+│ Page Header (24 bytes)             │
+│ Item Pointers (array of offsets)   │
+│    ↓          ↓          ↓         │
+│ ┌──────┐ ┌──────┐ ┌──────┐       │
+│ │Tuple1│ │Tuple2│ │Tuple3│       │
+│ │(row) │ │(row) │ │(row) │       │
+│ └──────┘ └──────┘ └──────┘       │
+│ Free Space                        │
+│ Special Space (for indexes)       │
+└────────────────────────────────────┘
+c) WAL (Write-Ahead Log)
+
+
+-- Current WAL position
+SELECT pg_current_wal_lsn();
+-- WAL directory size
+SELECT pg_size_pretty(sum(size))
+FROM pg_ls_waldir();
+The golden rule: PostgreSQL writes to WAL BEFORE writing to data files. This guarantees durability — if it crashes after WAL write but before data write, it replays the WAL on recovery.
+
+🔄 6. How a Query Flows Through the Architecture
+
+
+You type: SELECT * FROM orders WHERE id = 42;
+1. CLIENT        → sends query over TCP to port 5432
+2. POSTMASTER    → already assigned you a backend process
+3. BACKEND       → receives the query
+   ├── PARSER    → checks SQL syntax, builds parse tree
+   ├── ANALYZER  → resolves table/column names
+   ├── PLANNER   → decides: use index scan or sequential scan?
+   │              (checks pg_statistic for table stats)
+   └── EXECUTOR  → runs the plan
+       ├── checks SHARED BUFFERS first (cache hit? ✅ fast!)
+       ├── if not in cache → reads 8KB page from DISK
+       ├── puts page in shared buffers for next time
+       └── returns matching row to client
+4. CLIENT        → receives the result
+
+
+-- See the plan PostgreSQL chose
+EXPLAIN ANALYZE SELECT * FROM orders WHERE id = 42;
+🔄 7. How a Write Flows
+
+
+You type: INSERT INTO orders VALUES (42, 'laptop', 999);
+1. BACKEND receives query
+2. Writes the change to WAL BUFFER (in shared memory)
+3. WAL WRITER flushes WAL buffer → WAL FILE on disk  ← DURABILITY!
+4. Modifies the data page in SHARED BUFFERS (marks it "dirty")
+5. Returns "INSERT 0 1" to client
+6. Later... BGWRITER/CHECKPOINTER writes dirty page to DATA FILE on disk
+Key insight: The actual data file is updated lazily (later). The WAL file is updated immediately. That's why it's called "Write-Ahead Log" — the log is always ahead of the data.
+
+📋 Key Config Parameters — Quick Reference
+
+
+-- See all settings
+SELECT name, setting, unit, short_desc
+FROM pg_settings
+WHERE name IN (
+    'max_connections',
+    'shared_buffers',
+    'effective_cache_size',
+    'work_mem',
+    'maintenance_work_mem',
+    'wal_buffers',
+    'checkpoint_timeout',
+    'max_wal_size'
+);
+Parameter
+
+Default
+
+Recommended
+
+What it controls
+
+max_connections
+
+100
+
+Based on need
+
+Max simultaneous clients
+
+shared_buffers
+
+128MB
+
+25% of RAM
+
+Main data cache
+
+effective_cache_size
+
+4GB
+
+75% of RAM
+
+Planner's estimate of OS cache
+
+work_mem
+
+4MB
+
+32-256MB
+
+Memory per sort/hash operation
+
+maintenance_work_mem
+
+64MB
+
+512MB-1GB
+
+Memory for VACUUM, CREATE INDEX
+
+wal_buffers
+
+-1 (auto)
+
+64MB
+
+WAL write buffer
+
+checkpoint_timeout
+
+5min
+
+10-15min
+
+Time between checkpoints
+
+max_wal_size
+
+1GB
+
+4-8GB
+
+WAL size before forced checkpoint
+
+🎯 Architecture Summary in One Line Each
+Component
+
+One-Line Summary
+
+Postmaster
+
+The boss — listens for connections, spawns workers
+
+Backend
+
+Your personal query handler — one per connection
+
+Shared Buffers
+
+RAM cache for data pages — the #1 performance knob
+
+WAL
+
+Crash-safety guarantee — log before data
+
+BGWriter
+
+Background dish-washer — writes dirty pages to disk
+
+Checkpointer
+
+Video game save point — periodic full sync to disk
+
+Autovacuum
+
+Cleaning crew — removes dead rows from MVCC
+
+Stats Collector
+
+Accountant — tracks usage for the query planner
+
+Archiver
+
+Backup clerk — saves WAL files for disaster recovery
+
